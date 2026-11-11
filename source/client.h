@@ -1,0 +1,69 @@
+/*
+ * This file is part of Moonlight Embedded.
+ *
+ * Copyright (C) 2015-2017 Iwan Timmer
+ *
+ * Moonlight is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Moonlight is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Moonlight; if not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "xml.h"
+
+#include <Limelight.h>
+
+#include <stdbool.h>
+
+#define MIN_SUPPORTED_GFE_VERSION 3
+#define MAX_SUPPORTED_GFE_VERSION 7
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct _SERVER_DATA {
+  char* gpuType;
+  bool paired;
+  bool unsupported;
+  bool isNvidiaSoftware;
+  int currentGame;
+  int serverMajorVersion;
+  char* gsVersion;
+  PDISPLAY_MODE modes;
+  SERVER_INFORMATION serverInfo;
+  unsigned short httpPort;
+  unsigned short httpsPort;
+} SERVER_DATA, *PSERVER_DATA;
+
+/* Makes sure this Wii has a certificate made with the jitter generator
+ * (entropy.c), replacing one made by the old clock-seeded generator. Slow
+ * (RSA key generation) the first time; check gs_identity_needs_generation()
+ * first to show a "please wait" screen. */
+bool gs_identity_needs_generation(const char *keyDirectory);
+int gs_ensure_identity(const char *keyDirectory);
+/* Deletes the local "paired with this host" marker (for example after the Wii
+ * was removed from Sunshine's device list), so the next step pairs again. */
+void gs_forget_pairing(PSERVER_DATA server);
+
+int gs_init(PSERVER_DATA server, char* address, unsigned short httpPort, const char *keyDirectory, int logLevel, bool unsupported);
+void gs_cleanup();
+int gs_start_app(PSERVER_DATA server, PSTREAM_CONFIGURATION config, int appId, bool sops, bool localaudio, int gamepad_mask);
+int gs_applist(PSERVER_DATA server, PAPP_LIST *app_list);
+int gs_unpair(PSERVER_DATA server);
+int gs_pair(PSERVER_DATA server, char* pin);
+int gs_quit_app(PSERVER_DATA server);
+
+#ifdef __cplusplus
+}
+#endif

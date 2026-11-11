@@ -1,0 +1,6 @@
+[submodule "extern/moonlight-common-c"]
+	path = extern/moonlight-common-c
+	url = https://github.com/moonlight-stream/moonlight-common-c.git
+[submodule "extern/mbedtls"]
+	path = extern/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git

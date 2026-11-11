@@ -1,0 +1,26 @@
+# Build output
+build/
+*.elf
+*.dol
+dist/
+
+# Logs copied back from the SD card
+*.log
+
+# Local scratch / tools
+moonlight-temp/
+.claude/
+
+# Built dependencies (rebuilt from source, see README)
+extern/mbedtls-install/
+extern/opus-install/
+extern/opus-build/
+extern/mbedtls-build/
+
+# FFmpeg build artifacts (its source is committed)
+extern/ffmpeg/**/*.o
+extern/ffmpeg/**/*.d
+extern/ffmpeg/**/*.a
+
+# Reference code, not part of the build
+extern/moonlight-3ds/

@@ -1,0 +1,307 @@
+diff --git a/protocol.c b/protocol.c
+index 1fa4de0..ee21c20 100644
+--- a/protocol.c
++++ b/protocol.c
+@@ -9,6 +9,16 @@
+ #include "enet/time.h"
+ #include "enet/enet.h"
+ 
++#ifdef __WII__
++/* Wii port: report every ENet failure to moonlight.log (timestamped), so a
++ * dropped control connection says which step failed and with what error. */
++#include <errno.h>
++extern void app_log(const char *fmt, ...);
++#define ENET_WII_LOG(...) app_log(__VA_ARGS__)
++#else
++#define ENET_WII_LOG(...) ((void)0)
++#endif
++
+ static const size_t commandSizes [ENET_PROTOCOL_COMMAND_COUNT] =
+ {
+     0,
+@@ -1085,8 +1095,29 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
+        
+     if (peer != NULL)
+     {
+-       memcpy(& peer -> address, & host -> receivedPeerAddress, sizeof (host -> receivedPeerAddress));
+-       memcpy(& peer -> localAddress, & host -> receivedLocalAddress, sizeof (host -> receivedLocalAddress));
++#ifdef __WII__
++       /* Wii port: the host is IPv4. Never let a received packet overwrite the
++        * peer's address with something that isn't IPv4 (a bad address makes the
++        * next sendto() fail with EINVAL and drops the control connection).
++        * Log the raw address so we can see what arrived. */
++       if (host -> receivedPeerAddress.address.ss_family != AF_INET)
++       {
++          static unsigned badAddr = 0;
++          const unsigned char * b = (const unsigned char *) & host -> receivedPeerAddress.address;
++          badAddr ++;
++          if (badAddr <= 10 || badAddr % 100 == 0)
++            ENET_WII_LOG("[enet] receive: ignored non-IPv4 sender address (count %u): "
++                         "family=%d len=%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++                         badAddr, (int) host -> receivedPeerAddress.address.ss_family,
++                         (int) host -> receivedPeerAddress.addressLength,
++                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++       }
++       else
++#endif
++       {
++          memcpy(& peer -> address, & host -> receivedPeerAddress, sizeof (host -> receivedPeerAddress));
++          memcpy(& peer -> localAddress, & host -> receivedLocalAddress, sizeof (host -> receivedLocalAddress));
++       }
+        peer -> incomingDataTotal += host -> receivedDataLength;
+     }
+     
+@@ -1246,7 +1277,11 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
+          continue;
+ 
+        if (receivedLength < 0)
++       {
++         ENET_WII_LOG("[enet] receive: enet_socket_receive returned %d (errno %d)\n",
++                      receivedLength, errno);
+          return -1;
++       }
+ 
+        if (receivedLength == 0)
+          return 0;
+@@ -1268,6 +1303,8 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
+              continue;
+           
+           case -1:
++             ENET_WII_LOG("[enet] receive: intercept callback failed (packet %d bytes)\n",
++                          receivedLength);
+              return -1;
+         
+           default:
+@@ -1281,6 +1318,8 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
+           return 1;
+        
+        case -1:
++          ENET_WII_LOG("[enet] receive: handle_incoming_commands failed (packet %d bytes)\n",
++                       receivedLength);
+           return -1;
+ 
+        default:
+@@ -1848,6 +1887,7 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
+ #ifdef ENET_DEBUG
+             perror ("Error dispatching incoming packets");
+ #endif
++          ENET_WII_LOG("[enet] host_service: error dispatching incoming packets failed (errno %d)\n", errno);
+ 
+             return -1;
+ 
+@@ -1874,6 +1914,7 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
+ #ifdef ENET_DEBUG
+           perror ("Error sending outgoing packets");
+ #endif
++          ENET_WII_LOG("[enet] host_service: error sending outgoing packets failed (errno %d)\n", errno);
+ 
+           return -1;
+ 
+@@ -1890,6 +1931,7 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
+ #ifdef ENET_DEBUG
+           perror ("Error receiving incoming packets");
+ #endif
++          ENET_WII_LOG("[enet] host_service: error receiving incoming packets failed (errno %d)\n", errno);
+ 
+           return -1;
+ 
+@@ -1906,6 +1948,7 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
+ #ifdef ENET_DEBUG
+           perror ("Error sending outgoing packets");
+ #endif
++          ENET_WII_LOG("[enet] host_service: error sending outgoing packets failed (errno %d)\n", errno);
+ 
+           return -1;
+ 
+@@ -1924,6 +1967,7 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
+ #ifdef ENET_DEBUG
+              perror ("Error dispatching incoming packets");
+ #endif
++          ENET_WII_LOG("[enet] host_service: error dispatching incoming packets failed (errno %d)\n", errno);
+ 
+              return -1;
+ 
+@@ -1951,7 +1995,11 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
+           waitCondition = ENET_SOCKET_WAIT_RECEIVE | ENET_SOCKET_WAIT_INTERRUPT;
+ 
+           if (enet_socket_wait (host -> socket, & waitCondition, waitTime) != 0)
++          {
++            ENET_WII_LOG("[enet] host_service: enet_socket_wait failed (errno %d, wait %u ms)\n",
++                         errno, (unsigned) waitTime);
+             return -1;
++          }
+        }
+        while (waitCondition & ENET_SOCKET_WAIT_INTERRUPT);
+ 
+diff --git a/unix.c b/unix.c
+index 5ad7ca9..01a082a 100644
+--- a/unix.c
++++ b/unix.c
+@@ -28,6 +28,23 @@
+ #define ENET_BUILDING_LIB 1
+ #include "enet/enet.h"
+ 
++#ifdef __WII__
++#include <stdio.h>
++#include <stdarg.h>
++/* Socket-level ENet failures go to moonlight.log (timestamped, in order with
++ * everything else) through the app's shared logger in main.c. */
++extern void app_logv(const char *fmt, va_list ap);
++static void enet_log(const char *fmt, ...) {
++    va_list ap;
++    va_start(ap, fmt);
++    app_logv(fmt, ap);
++    va_end(ap);
++}
++#define ENET_LOG(...) enet_log(__VA_ARGS__)
++#else
++#define ENET_LOG(...) ((void)0)
++#endif
++
+ #if defined(__APPLE__)
+ #if !defined(IPV6_RECVPKTINFO) || !defined(IPV6_PKTINFO)
+ #warning Missing IPv6 socket option definitions. Is __APPLE_USE_RFC_3542 defined?
+@@ -165,6 +182,25 @@
+ #ifndef NO_MSGAPI
+ #define NO_MSGAPI 1
+ #endif
++#elif defined(__WII__)
++#ifndef HAS_POLL
++#define HAS_POLL 1
++#endif
++#ifndef HAS_IOCTL
++#define HAS_IOCTL 1
++#endif
++#ifndef HAS_INET_PTON
++#define HAS_INET_PTON 1
++#endif
++#ifndef HAS_INET_NTOP
++#define HAS_INET_NTOP 1
++#endif
++#ifndef HAS_SOCKLEN_T
++#define HAS_SOCKLEN_T 1
++#endif
++#ifndef NO_MSGAPI
++#define NO_MSGAPI 1
++#endif
+ #elif defined(__HAIKU__)
+ #ifndef HAS_POLL
+ #define HAS_POLL 1
+@@ -191,14 +227,20 @@
+ #endif
+ 
+ #if !defined(HAS_SOCKLEN_T) && !defined(__socklen_t_defined) && !defined(__HAIKU__)
+-typedef int socklen_t;
++// typedef int socklen_t;
+ #endif
+ 
+ #ifndef SOMAXCONN
+ #define SOMAXCONN 128
+ #endif
+ 
+-#ifndef MSG_NOSIGNAL
++#if defined(__WII__)
++// The Wii IOS SO_SENDTO/SO_RECVFROM ioctls reject MSG_NOSIGNAL (0x20000) with
++// EOPNOTSUPP (errno 95). There are no signals (no SIGPIPE) on the Wii, so this
++// flag is meaningless here and must be forced to 0.
++#undef MSG_NOSIGNAL
++#define MSG_NOSIGNAL 0
++#elif !defined(MSG_NOSIGNAL)
+ #define MSG_NOSIGNAL 0
+ #endif
+ 
+@@ -653,8 +695,32 @@ enet_socket_send (ENetSocket socket,
+         sendLength = buffers[0].dataLength;
+     }
+ 
++    socklen_t usedTolen = peerAddress -> addressLength;
++#if defined(__WII__)
++    // The Wii IOS SO_SENDTO rejects a sockaddr larger than its 28-byte
++    // destaddr buffer with EOVERFLOW (139). The peer's addressLength gets
++    // polluted with sizeof(sockaddr_storage) by the receive path (which memcpy's
++    // the whole ENetAddress), so force the correct 8-byte IPv4 length here.
++    // The sockaddr's sin_len byte is already 8 (set by resolveHostName / recvfrom).
++    socklen_t wiiTolen = peerAddress -> addressLength;
++    if (peerAddress -> address.ss_family == AF_INET)
++      wiiTolen = sizeof (struct sockaddr_in) - sizeof (((struct sockaddr_in *) 0) -> sin_zero);
++    usedTolen = wiiTolen;
++    sentLength = sendto (socket, sendBuffer, sendLength, MSG_NOSIGNAL,
++        (struct sockaddr *) & peerAddress -> address, wiiTolen);
++#else
+     sentLength = sendto (socket, sendBuffer, sendLength, MSG_NOSIGNAL,
+         (struct sockaddr *) & peerAddress -> address, peerAddress -> addressLength);
++#endif
++    if (sentLength < 0)
++    {
++      const unsigned char * b = (const unsigned char *) & peerAddress -> address;
++      ENET_LOG("[enet] sendto failed: errno %d, tolen %d, peer family=%d addressLength=%d "
++               "bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++               errno, (int) usedTolen, (int) peerAddress -> address.ss_family,
++               (int) peerAddress -> addressLength,
++               b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++    }
+ 
+     if (bufferCount > 1)
+       free(sendBuffer);
+@@ -771,7 +837,27 @@ enet_socket_receive (ENetSocket socket,
+ #ifdef NO_MSGAPI
+     // This will ONLY work with a single buffer!
+ 
++#if defined(__WII__)
++    // The Wii IOS SO_RECVFROM rejects a fromlen larger than the max sockaddr it
++    // handles (28 bytes, see sendto_params.destaddr[28]). sizeof(sockaddr_storage)
++    // is 128+, which trips EINVAL. Use the max real sockaddr size instead.
++    peerAddress -> addressLength = sizeof (struct sockaddr_in6);
++
++    // The Wii IOS's non-blocking socket mode is also unreliable — recvfrom() can
++    // block even after ioctl(FIONBIO). Poll first so we never block on an empty
++    // socket (return 0 = no data, like EWOULDBLOCK).
++    {
++        struct pollfd pfd;
++        pfd.fd = socket;
++        pfd.events = POLLIN;
++        pfd.revents = 0;
++        if (poll(&pfd, 1, 0) <= 0) {
++            return 0;
++        }
++    }
++#else
+     peerAddress -> addressLength = sizeof (peerAddress -> address);
++#endif
+     recvLength = recvfrom (socket, buffers[0].data, buffers[0].dataLength, MSG_NOSIGNAL,
+         (struct sockaddr *) & peerAddress -> address, & peerAddress -> addressLength);
+ 
+@@ -780,6 +866,7 @@ enet_socket_receive (ENetSocket socket,
+        if (errno == EWOULDBLOCK)
+          return 0;
+ 
++       ENET_LOG("[enet] recvfrom failed: errno %d, fromlen %d\n", errno, (int) peerAddress -> addressLength);
+        return -1;
+     }
+ 
+@@ -910,6 +997,17 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
+         }
+         svcSleepThread(1000);
+     }
++#elif defined(__WII__)
++    // poll(timeout) blocks forever on the Wii IOS for small (non-zero) timeouts,
++    // so emulate the timeout with a non-blocking poll + sleep loop like the 3DS.
++    enet_uint32 poll_start = enet_time_get();
++    for (enet_uint32 i = poll_start; (i - poll_start) < timeout; i = enet_time_get()) {
++        pollCount = poll(& pollSocket, 1, 0);
++        if (pollCount) {
++            break;
++        }
++        usleep(1000);
++    }
+ #else
+     pollCount = poll (& pollSocket, 1, timeout);
+ #endif
+@@ -923,6 +1021,7 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
+             return 0;
+         }
+ 
++        ENET_LOG("[enet] poll failed: errno %d\n", errno);
+         return -1;
+     }
+ 

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>Wii Moonlight</name>
+  <coder>NerdPup</coder>
+  <version>0.1.0-alpha</version>
+  <release_date>20261111000000</release_date>
+  <short_description>Stream PC games from Sunshine (ALPHA)</short_description>
+  <long_description>ALPHA VERSION - very early in development. Expect bugs, freezes and crashes.
+
+Wii Moonlight streams games and your desktop from a PC running Sunshine to the Wii, using the Moonlight protocol.
+
+Features:
+- Finds Sunshine PCs on your network automatically, or enter the IP address yourself
+- Pairing with an on-screen PIN
+- 360p (recommended) or 480p video, stereo audio
+- Wii Remote as mouse (IR pointer) and gamepad, with Nunchuk support
+
+Setup: in Sunshine's web UI, set FEC to 50. A wired (Ethernet) connection works best.
+
+Please report bugs on GitHub and include moonlight.log from this app's folder on the SD card.
+
+Licensed under GPLv3. Based on Moonlight Embedded and moonlight-common-c.</long_description>
+</app>

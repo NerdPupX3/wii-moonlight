@@ -1,0 +1,595 @@
+diff --git a/src/ControlStream.c b/src/ControlStream.c
+index 859bd18..04ac9b6 100644
+--- a/src/ControlStream.c
++++ b/src/ControlStream.c
+@@ -752,7 +752,9 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
+         packet->type = LE16(ptype);
+         memcpy(&packet[1], payload, paylen);
+ 
++        Limelog("[enet] send: locking mutex (ptype %d)\n", (int)ptype);
+         PltLockMutex(&enetMutex);
++        Limelog("[enet] send: locked\n");
+     }
+ 
+     volatile bool packetFreed = false;
+@@ -1773,8 +1775,8 @@ int startControlStream(void) {
+         LC_ASSERT(ControlPortNumber != 0);
+ 
+         enet_address_set_address(&localAddress, (struct sockaddr *)&LocalAddr, AddrLen);
+-#ifdef __3DS__
+-        // binding to wildcard port is broken on the 3DS, so we need to define a port manually
++#if defined(__3DS__) || defined(__WII__)
++        // binding to wildcard port is broken on the 3DS and Wii IOS, so we need to define a port manually
+         enet_address_set_port(&localAddress, htons(n3ds_udp_port++));
+ #else
+         enet_address_set_port(&localAddress, 0); // Wildcard port
+@@ -1842,7 +1844,9 @@ int startControlStream(void) {
+         }
+ 
+         // Ensure the connect verify ACK is sent immediately
++        Limelog("[enet] flushing connect verify ACK\n");
+         enet_host_flush(client);
++        Limelog("[enet] flushed, setting peer timeout\n");
+ 
+ #ifdef __3DS__
+         // Set the peer timeout to 1 minute and limit backoff to 2x RTT
+@@ -1866,7 +1870,9 @@ int startControlStream(void) {
+         enableNoDelay(ctlSock);
+     }
+ 
++    Limelog("[enet] creating control recv thread\n");
+     err = PltCreateThread("ControlRecv", controlReceiveThreadFunc, NULL, &controlReceiveThread);
++    Limelog("[enet] control recv thread create returned %d\n", err);
+     if (err != 0) {
+         stopping = true;
+         if (ctlSock != INVALID_SOCKET) {
+diff --git a/src/Misc.c b/src/Misc.c
+index e3cd6b0..9868cf6 100644
+--- a/src/Misc.c
++++ b/src/Misc.c
+@@ -26,6 +26,12 @@ static int serviceEnetHostInternal(ENetHost* client, ENetEvent* event, enet_uint
+         }
+ 
+         ret = enet_host_service(client, event, selectedTimeout);
++        if (ret < 0) {
++            Limelog("[enet] host_service returned %d, errno=%d\n", ret, (int)LastSocketError());
++        }
++        else if (ret > 0 && event != NULL) {
++            Limelog("[enet] host_service event type=%d\n", (int)event->type);
++        }
+         if (ret != 0 || timeoutMs == 0) {
+             break;
+         }
+diff --git a/src/Platform.c b/src/Platform.c
+index 458fd98..cf2de56 100644
+--- a/src/Platform.c
++++ b/src/Platform.c
+@@ -129,6 +129,10 @@ int PltCreateMutex(PLT_MUTEX* mutex) {
+     OSFastMutex_Init(mutex, "");
+ #elif defined(__3DS__)
+     LightLock_Init(mutex);
++#elif defined(__WII__)
++    if (LWP_MutexInit(mutex, false) != 0) {
++        return -1;
++    }
+ #else
+     int err = pthread_mutex_init(mutex, NULL);
+     if (err != 0) {
+@@ -146,6 +150,8 @@ void PltDeleteMutex(PLT_MUTEX* mutex) {
+     // No-op to destroy a SRWLOCK
+ #elif defined(__WIIU__) || defined(__3DS__)
+ 
++#elif defined(__WII__)
++    LWP_MutexDestroy(*mutex);
+ #else
+     pthread_mutex_destroy(mutex);
+ #endif
+@@ -158,6 +164,8 @@ void PltLockMutex(PLT_MUTEX* mutex) {
+     OSFastMutex_Lock(mutex);
+ #elif defined(__3DS__)
+     LightLock_Lock(mutex);
++#elif defined(__WII__)
++    LWP_MutexLock(*mutex);
+ #else
+     pthread_mutex_lock(mutex);
+ #endif
+@@ -170,6 +178,8 @@ void PltUnlockMutex(PLT_MUTEX* mutex) {
+     OSFastMutex_Unlock(mutex);
+ #elif defined(__3DS__)
+     LightLock_Unlock(mutex);
++#elif defined(__WII__)
++    LWP_MutexUnlock(*mutex);
+ #else
+     pthread_mutex_unlock(mutex);
+ #endif
+@@ -187,6 +197,14 @@ void PltJoinThread(PLT_THREAD* thread) {
+ #elif defined(__3DS__)
+     threadJoin(thread->thread, U64_MAX);
+     threadFree(thread->thread);
++#elif defined(__WII__)
++    LWP_JoinThread(thread->thread, NULL);
++    // Deliberately leak the stack. LWP_JoinThread() returns as soon as the
++    // thread's state is marked EXITED, but the thread's exit sequence (the final
++    // context switch off its own stack) may not have finished yet. Freeing the
++    // stack in that window is a use-after-free that crashes with a DSI. The
++    // process exits right after teardown, so the ~256KB per thread is harmless.
++    thread->stack = NULL;
+ #else
+     pthread_join(thread->thread, NULL);
+ #endif
+@@ -204,6 +222,8 @@ void PltDetachThread(PLT_THREAD* thread) {
+     OSDetachThread(&thread->thread);
+ #elif defined(__3DS__)
+     threadDetach(thread->thread);
++#elif defined(__WII__)
++    // LWP has no detach; the stack will be leaked (rarely used).
+ #else
+     pthread_detach(thread->thread);
+ #endif
+@@ -287,6 +307,40 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
+             return -1;
+         }
+     }
++#elif defined(__WII__)
++    {
++        // Allocate an explicit stack. LWP's default (8 KB) is far too small
++        // for the streaming threads.
++        const int stack_size = 0x40000;
++        void* stack = memalign(32, stack_size);
++        if (stack == NULL) {
++            free(ctx);
++            return -1;
++        }
++
++        thread->stack = stack;
++
++        // stackbase is the LOWEST address of the stack: libogc computes the
++        // top itself as stackbase + stack_size (see lwpc_thread.c). Passing
++        // the top here made every thread run on the 256 KB *past* its own
++        // allocation, memory the heap gave to other code; when that memory was
++        // written, a thread's saved return addresses were wiped and it jumped
++        // to address 0 (ISI crash with PC=0, LR=0 and a zeroed stack dump).
++        // The thread starts running immediately; no separate resume is needed.
++        if (LWP_CreateThread(&thread->thread, ThreadProc, ctx,
++                             stack, stack_size, 0x50) != 0) {
++            free(ctx);
++            free(stack);
++            thread->stack = NULL;
++            return -1;
++        }
++        {
++            extern void app_log(const char *fmt, ...);
++            app_log("[thread] created \"%s\": handle=%u stack %p..%p (%d KB)\n",
++                    name, (unsigned)thread->thread, stack,
++                    (void*)((uint8_t*)stack + stack_size), stack_size / 1024);
++        }
++    }
+ #else
+     {
+         pthread_attr_t attr;
+@@ -296,6 +350,10 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
+ #ifdef __vita__
+         pthread_attr_setstacksize(&attr, 0x100000);
+ #endif
++#ifdef __WII__
++        /* libogc's default thread stack is far too small for the streaming threads. */
++        pthread_attr_setstacksize(&attr, 0x40000);
++#endif
+ 
+         ctx->name = name;
+ 
+@@ -383,6 +441,10 @@ int PltCreateConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
+     OSFastCond_Init(cond, "");
+ #elif defined(__3DS__)
+     CondVar_Init(cond);
++#elif defined(__WII__)
++    if (LWP_CondInit(cond) != 0) {
++        return -1;
++    }
+ #else
+     pthread_cond_init(cond, NULL);
+ #endif
+@@ -399,6 +461,8 @@ void PltDeleteConditionVariable(PLT_COND* cond) {
+     // No-op to delete an OSFastCondition
+ #elif defined(__3DS__)
+     // No-op to delete CondVar
++#elif defined(__WII__)
++    LWP_CondDestroy(*cond);
+ #else
+     pthread_cond_destroy(cond);
+ #endif
+@@ -411,6 +475,8 @@ void PltSignalConditionVariable(PLT_COND* cond) {
+     OSFastCond_Signal(cond);
+ #elif defined(__3DS__)
+     CondVar_Signal(cond);
++#elif defined(__WII__)
++    LWP_CondSignal(*cond);
+ #else
+     pthread_cond_signal(cond);
+ #endif
+@@ -423,6 +489,8 @@ void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
+     OSFastCond_Wait(cond, mutex);
+ #elif defined(__3DS__)
+     CondVar_Wait(cond, mutex);
++#elif defined(__WII__)
++    LWP_CondWait(*cond, *mutex);
+ #else
+     pthread_cond_wait(cond, mutex);
+ #endif
+@@ -517,6 +585,25 @@ uint64_t PltGetMicroseconds(void) {
+     return elapsed * 1000 / CPU_TICKS_PER_MSEC;
+ }
+ 
++#elif defined(__WII__)
++
++static uint64_t start_ticks;
++
++void PltTicksInit(void) {
++    if (ticks_started) {
++        return;
++    }
++    ticks_started = true;
++    start_ticks = (uint64_t)gettime();
++}
++
++uint64_t PltGetMicroseconds(void) {
++    if (!ticks_started) {
++        PltTicksInit();
++    }
++    return ticks_to_microsecs(gettime() - start_ticks);
++}
++
+ #else
+ 
+ /* Use CLOCK_MONOTONIC_RAW, if available, which is not subject to adjustment by NTP */
+diff --git a/src/Platform.h b/src/Platform.h
+index f219864..cdbf7f5 100644
+--- a/src/Platform.h
++++ b/src/Platform.h
+@@ -56,6 +56,22 @@
+ #elif defined(__3DS__)
+ #include <3ds.h>
+ #include <fcntl.h>
++#elif defined(__WII__)
++#include <unistd.h>
++#include <pthread.h>
++#include <sys/ioctl.h>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <netdb.h>
++#include <network.h>
++#include <ogc/lwp_watchdog.h>
++#include <ogc/lwp.h>
++#include <ogc/mutex.h>
++#include <ogc/cond.h>
++#include <malloc.h>
+ #else
+ #include <unistd.h>
+ #include <pthread.h>
+diff --git a/src/PlatformSockets.c b/src/PlatformSockets.c
+index cec96f3..a63d22c 100644
+--- a/src/PlatformSockets.c
++++ b/src/PlatformSockets.c
+@@ -35,8 +35,10 @@ DWORD (WINAPI *pfnWlanSetInterface)(HANDLE hClientHandle, CONST GUID *pInterface
+ 
+ #endif
+ 
+-#ifdef __3DS__
++#if defined(__3DS__) || defined(__WII__)
+ in_port_t n3ds_udp_port = 47998;
++#endif
++#ifdef __3DS__
+ static const int n3ds_max_buf_size = 0x20000;
+ #endif
+ 
+@@ -79,8 +81,8 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
+     // losing some data in a very rare case is fine, especially because we get to
+     // halve the number of syscalls per packet by avoiding select().
+     return setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeoutMs, sizeof(timeoutMs));
+-#elif defined(__WIIU__) || defined(__3DS__)
+-    // timeouts aren't supported on Wii U or 3DS
++#elif defined(__WIIU__) || defined(__3DS__) || defined(__WII__)
++    // timeouts aren't supported on Wii U, 3DS, or Wii
+     return -1;
+ #else
+     struct timeval val;
+@@ -160,6 +162,25 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
+         svcSleepThread(1000);
+     }
+     return err;
++#elif defined(__WII__)
++    // The Wii IOS poll() blocks forever on small non-zero timeouts, so emulate
++    // the timeout with a non-blocking poll loop (same trick as the 3DS port).
++    int err;
++    if (timeoutMs <= 0) {
++        return poll(pollFds, pollFdsCount, 0);
++    }
++    uint64_t poll_start = PltGetMillis();
++    for (;;) {
++        err = poll(pollFds, pollFdsCount, 0);
++        if (err) {
++            break;
++        }
++        if (PltGetMillis() - poll_start >= (uint64_t)timeoutMs) {
++            break;
++        }
++        PltSleepMs(1);
++    }
++    return err;
+ #else
+     return poll(pollFds, pollFdsCount, timeoutMs);
+ #endif
+@@ -317,10 +338,11 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
+ #endif
+     }
+ 
+-#ifdef __3DS__
+-    // binding to wildcard port is broken on the 3DS, so we need to define a port manually
+-    struct sockaddr_in *n3ds_addr = &bindAddr;
+-    n3ds_addr->sin_port = htons(n3ds_udp_port++);
++#if defined(__3DS__) || defined(__WII__)
++    // binding to wildcard (port 0) is broken on the 3DS and Wii IOS, so we
++    // need to define a port manually.
++    struct sockaddr_in *udp_addr = (struct sockaddr_in*)&bindAddr;
++    udp_addr->sin_port = htons(n3ds_udp_port++);
+ #endif
+     if (bind(s, (struct sockaddr*) &bindAddr, addrLen) == SOCKET_ERROR) {
+         err = LastSocketError();
+@@ -449,6 +471,28 @@ SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlo
+ }
+ 
+ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
++#if defined(__WII__)
++    // IOS's SO_CONNECT returns EPERM on non-blocking sockets, so use a plain
++    // blocking connect. The RTSP/control connections target a host we just
++    // reached over HTTPS, so this completes (or fails) quickly.
++    SOCKET s;
++    LC_SOCKADDR addr;
++    (void)timeoutSec;
++    s = createSocket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP, false);
++    if (s == INVALID_SOCKET) {
++        return INVALID_SOCKET;
++    }
++    memcpy(&addr, dstaddr, addrlen);
++    SET_PORT(&addr, port);
++    if (connect(s, (struct sockaddr*)&addr, addrlen) < 0) {
++        int err = (int)LastSocketError();
++        Limelog("connect() failed: %d\n", err);
++        closeSocket(s);
++        SetLastSocketError(err);
++        return INVALID_SOCKET;
++    }
++    return s;
++#else
+     SOCKET s;
+     LC_SOCKADDR addr;
+     struct pollfd pfd;
+@@ -568,6 +612,7 @@ Exit:
+     }
+ 
+     return s;
++#endif
+ }
+ 
+ int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKADDR_LEN targetAddrLen, unsigned short targetPort,
+@@ -670,6 +715,32 @@ static bool isPrivateNetworkAddressV4(struct sockaddr_in* address, bool matchCGN
+ 
+ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockaddr_storage* addr, SOCKADDR_LEN* addrLen)
+ {
++#if defined(__WII__)
++    // lwIP has no getaddrinfo/getnameinfo. Resolve IPv4 manually: literal
++    // address first, then net_gethostbyname() for hostnames.
++    struct sockaddr_in sin;
++    memset(&sin, 0, sizeof(sin));
++    sin.sin_family = AF_INET;
++    sin.sin_port = 0;
++    // The Wii IOS's sockaddr_in (wii_sockaddr_in) has NO sin_zero field — it is
++    // 8 bytes (len+family+port+addr). net_connect/net_bind truncate to that size
++    // internally, but net_sendto uses the caller's sa_len/tolen verbatim, so we
++    // must report the 8-byte length or UDP sendto() fails with EINVAL.
++    sin.sin_len = sizeof(sin) - sizeof(sin.sin_zero);
++
++    if (inet_pton(AF_INET, host, &sin.sin_addr) != 1) {
++        struct hostent *he = net_gethostbyname(host);
++        if (he == NULL || he->h_addr_list == NULL) {
++            Limelog("resolveHostName(%s) failed: DNS resolution failed\n", host);
++            return -1;
++        }
++        memcpy(&sin.sin_addr, he->h_addr_list[0], sizeof(struct in_addr));
++    }
++
++    memcpy(addr, &sin, sizeof(sin));
++    *addrLen = sizeof(sin) - sizeof(sin.sin_zero);
++    return 0;
++#else
+     struct addrinfo hints, *res, *currentAddr;
+     int err;
+     bool needsFallbackV4 = false;
+@@ -745,6 +816,7 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
+         Limelog("No working addresses found for host: %s\n", host);
+         return -1;
+     }
++#endif
+ }
+ 
+ #ifdef AF_INET6
+@@ -792,7 +864,7 @@ bool isPrivateNetworkAddress(struct sockaddr_storage* address) {
+ }
+ 
+ bool isNat64SynthesizedAddress(struct sockaddr_storage* address) {
+-#ifdef AF_INET6
++#if defined(AF_INET6) && !defined(__WII__)
+     if (address->ss_family == AF_INET6) {
+         struct sockaddr_in6* sin6 = (struct sockaddr_in6*)address;
+         struct addrinfo hints, *res, *currentAddr;
+@@ -1009,8 +1081,8 @@ int initializePlatformSockets(void) {
+ #if defined(LC_WINDOWS) && !defined(NXDK)
+     WSADATA data;
+     return WSAStartup(MAKEWORD(2, 0), &data);
+-#elif defined(__vita__) || defined(__WIIU__) || defined(__3DS__)
+-    return 0; // already initialized
++#elif defined(__vita__) || defined(__WIIU__) || defined(__3DS__) || defined(__WII__)
++    return 0; // already initialized (net_init() done by the app)
+ #elif defined(LC_POSIX) && !defined(LC_CHROME)
+     // Disable SIGPIPE signals to avoid us getting
+     // killed when a socket gets an EPIPE error
+diff --git a/src/PlatformSockets.h b/src/PlatformSockets.h
+index 4bac8bd..a6bca6e 100644
+--- a/src/PlatformSockets.h
++++ b/src/PlatformSockets.h
+@@ -12,6 +12,10 @@
+ extern in_port_t n3ds_udp_port;
+ #endif
+ 
++#ifdef __WII__
++extern in_port_t n3ds_udp_port;
++#endif
++
+ #ifdef __vita__
+ #ifdef AF_INET6
+ #undef AF_INET6
+diff --git a/src/PlatformThreads.h b/src/PlatformThreads.h
+index 822b90b..379f3a3 100644
+--- a/src/PlatformThreads.h
++++ b/src/PlatformThreads.h
+@@ -26,6 +26,14 @@ typedef struct _PLT_THREAD {
+     Thread thread;
+     bool cancelled;
+ } PLT_THREAD;
++#elif defined(__WII__)
++typedef mutex_t PLT_MUTEX;
++typedef cond_t PLT_COND;
++typedef struct _PLT_THREAD {
++    lwp_t thread;
++    bool cancelled;
++    void* stack;
++} PLT_THREAD;
+ #elif defined (LC_POSIX)
+ typedef pthread_mutex_t PLT_MUTEX;
+ typedef pthread_cond_t PLT_COND;
+diff --git a/src/RtspConnection.c b/src/RtspConnection.c
+index e958101..6fa748c 100644
+--- a/src/RtspConnection.c
++++ b/src/RtspConnection.c
+@@ -383,6 +383,35 @@ Exit:
+     return ret;
+ }
+ 
++// Returns true if the RTSP response in buffer[0..len) is complete, i.e. the
++// header block ("\r\n\r\n") and any Content-Length body have all been received.
++static bool isRtspResponseComplete(const char* buffer, int len) {
++    int i;
++    int headerEnd = -1;
++
++    // Find the end of the headers ("\r\n\r\n").
++    for (i = 0; i + 3 < len; i++) {
++        if (buffer[i] == '\r' && buffer[i + 1] == '\n' &&
++            buffer[i + 2] == '\r' && buffer[i + 3] == '\n') {
++            headerEnd = i + 4;
++            break;
++        }
++    }
++    if (headerEnd < 0) {
++        // Headers are not complete yet.
++        return false;
++    }
++
++    // Parse the Content-Length header if present (Sunshine emits "Content-Length: N").
++    int contentLength = 0;
++    const char* cl = strstr(buffer, "Content-Length:");
++    if (cl != NULL && cl < buffer + headerEnd) {
++        contentLength = atoi(cl + 15);
++    }
++
++    return len >= headerEnd + contentLength;
++}
++
+ // Send RTSP message and get response over TCP
+ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response, int* error) {
+     SOCK_RET err;
+@@ -393,11 +422,16 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
+     char* responseBuffer;
+     int responseBufferSize;
+     int connectRetries;
++    int txnRetries;
+ 
+     *error = -1;
+     ret = false;
+     responseBuffer = NULL;
+     connectRetries = 0;
++    txnRetries = 0;
++
++RetryTxn:
++    connectRetries = 0;
+ 
+     // Retry up to 10 seconds if we receive ECONNREFUSED errors from the host PC.
+     // This can happen with GFE 3.22 when initially launching a session because it
+@@ -482,6 +516,31 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
+         if (err < 0) {
+             // Error reading
+             *error = LastSocketError();
++#if defined(__WII__)
++            // IOS reports a graceful close (FIN) as ECONNRESET in the
++            // read-until-close pattern. Treat it as end-of-response if we
++            // have already received data (a real reset with zero data is
++            // still an error).
++            if (*error == ECONNRESET && offset > 0) {
++                break;
++            }
++            // A reset with NO data received can also be IOS losing the response
++            // (Sunshine replies but the FIN/RST races our first read). Retry the
++            // whole transaction a few times before giving up, with a short delay
++            // so a transient network blip has time to clear.
++            if (*error == ECONNRESET && offset == 0 && txnRetries < 3) {
++                Limelog("RTSP response reset with no data; retrying transaction\n");
++                closeSocket(sock);
++                sock = INVALID_SOCKET;
++                free(responseBuffer);
++                responseBuffer = NULL;
++                free(serializedMessage);
++                serializedMessage = NULL;
++                txnRetries++;
++                PltSleepMs(100);
++                goto RetryTxn;
++            }
++#endif
+             Limelog("Failed to read RTSP response: %d\n", *error);
+             goto Exit;
+         }
+@@ -497,6 +556,16 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
+             }
+       
+             offset += err;
++
++#if defined(__WII__)
++            // The Wii IOS reports the server's FIN as ECONNRESET, so the
++            // read-until-close pattern can lose the response when the FIN races
++            // our read. Stop as soon as the full response (headers + Content-Length
++            // body) has arrived instead of waiting for the close.
++            if (isRtspResponseComplete(responseBuffer, offset)) {
++                break;
++            }
++#endif
+         }
+     }
+ 
+@@ -1356,6 +1425,16 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
+         int error = -1;
+ 
+         if (!playStream(&response, "/", &error)) {
++            if (error == ECONNRESET) {
++                // Sunshine starts the streams immediately after accepting PLAY and
++                // closes the RTSP connection. The Wii reports that close as ECONNRESET
++                // before the 200 OK data arrives, so the PLAY actually succeeded.
++                // Treat the lost response as success rather than retrying (Sunshine
++                // has already begun streaming, so a retry is pointless/harmful).
++                Limelog("RTSP PLAY response lost (ECONNRESET); proceeding\n");
++                ret = 0;
++                goto Exit;
++            }
+             Limelog("RTSP PLAY request failed: %d\n", error);
+             ret = error;
+             goto Exit;
