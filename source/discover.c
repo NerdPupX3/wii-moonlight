@@ -200,6 +200,13 @@ static int g_queries, g_replies, g_ignored, g_next_sched;
 static DISCOVERED_HOST g_hosts[DISCOVER_MAX_HOSTS];
 static int g_count;
 
+/* The Wii's IOS network stack uses an 8-byte sockaddr_in: length, family,
+ * port, address, with no sin_zero padding. libogc's struct has the 8 padding
+ * bytes, so sizeof() is 16, and IOS rejects that with -EINVAL (-22). Both
+ * sin_len and the length argument must say 8. The stream code has the same fix
+ * in resolveHostName (patches/moonlight-common-c.patch). */
+#define WII_SOCKADDR_LEN 8
+
 static u64 now_ms(void) { return ticks_to_millisecs(gettime()); }
 
 static void send_query(void)
@@ -209,15 +216,16 @@ static void send_query(void)
     struct sockaddr_in dst;
 
     memset(&dst, 0, sizeof(dst));
+    dst.sin_len = WII_SOCKADDR_LEN;
     dst.sin_family = AF_INET;
     dst.sin_port = htons(5353);
     dst.sin_addr.s_addr = htonl(0xE00000FB);        /* 224.0.0.251 */
-    s32 rm = net_sendto(g_sock, q, ql, 0, (struct sockaddr *)&dst, sizeof(dst));
+    s32 rm = net_sendto(g_sock, q, ql, 0, (struct sockaddr *)&dst, WII_SOCKADDR_LEN);
 
     /* Also to the broadcast address: on some networks/IOS versions multicast
      * sends fail, and responders bound to port 5353 receive broadcasts too. */
     dst.sin_addr.s_addr = htonl(0xFFFFFFFF);
-    s32 rb = net_sendto(g_sock, q, ql, 0, (struct sockaddr *)&dst, sizeof(dst));
+    s32 rb = net_sendto(g_sock, q, ql, 0, (struct sockaddr *)&dst, WII_SOCKADDR_LEN);
 
     g_queries++;
     g_last_query_ms = now_ms();
@@ -229,7 +237,10 @@ int discover_begin(void)
     discover_end();
     g_count = g_queries = g_replies = g_ignored = g_next_sched = 0;
 
-    g_sock = net_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    /* Protocol MUST be 0 (IPPROTO_IP, "the default for this type", which is
+     * UDP for SOCK_DGRAM). libogc's net_socket refuses IPPROTO_UDP with
+     * -EPROTONOSUPPORT (-123), which silently disabled the whole search. */
+    g_sock = net_socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (g_sock < 0) {
         app_log("[discover] ERROR: net_socket failed (%d)\n", g_sock);
         g_sock = -1;
@@ -240,10 +251,11 @@ int discover_begin(void)
 
     struct sockaddr_in local;
     memset(&local, 0, sizeof(local));
+    local.sin_len = WII_SOCKADDR_LEN;
     local.sin_family = AF_INET;
     local.sin_port = 0;                             /* any port except 5353 = legacy unicast */
     local.sin_addr.s_addr = INADDR_ANY;
-    s32 rbind = net_bind(g_sock, (struct sockaddr *)&local, sizeof(local));
+    s32 rbind = net_bind(g_sock, (struct sockaddr *)&local, WII_SOCKADDR_LEN);
 
     u32 me = net_gethostip();
     app_log("[discover] start: socket=%d SO_BROADCAST=%d bind=%d, this Wii is %u.%u.%u.%u\n",
@@ -254,6 +266,17 @@ int discover_begin(void)
 
 static void add_host(const DISCOVERED_HOST *h)
 {
+    /* A PC on the network twice (cable + Wi-Fi) answers from both addresses
+     * under the same name: list it once, at the first address that answered. */
+    for (int i = 0; i < g_count; i++) {
+        if (strcmp(h->name, "Sunshine") != 0 && strcmp(g_hosts[i].name, h->name) == 0 &&
+            strcmp(g_hosts[i].ip, h->ip) != 0) {
+            if (g_replies <= REPLY_LOG_LIMIT)
+                app_log("[discover] \"%s\" also answered from %s; keeping %s\n",
+                        h->name, h->ip, g_hosts[i].ip);
+            return;
+        }
+    }
     for (int i = 0; i < g_count; i++) {
         if (strcmp(g_hosts[i].ip, h->ip) == 0) {
             if (strcmp(g_hosts[i].name, h->name) != 0 && strcmp(h->name, "Sunshine") != 0)

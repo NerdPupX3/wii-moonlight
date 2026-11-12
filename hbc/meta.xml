@@ -2,8 +2,8 @@
 <app version="1">
   <name>Wii Moonlight</name>
   <coder>NerdPup</coder>
-  <version>0.1.0-alpha</version>
-  <release_date>20261111000000</release_date>
+  <version>0.1.1-alpha</version>
+  <release_date>20261112000000</release_date>
   <short_description>Stream PC games from Sunshine (ALPHA)</short_description>
   <long_description>ALPHA VERSION - very early in development. Expect bugs, freezes and crashes.
 
