@@ -204,6 +204,8 @@ static void send_gamepad(int flags, int lt, int rt, short lsx, short lsy, uint64
 }
 
 /* Converts the Nunchuk stick (angle in degrees, magnitude 0..1) to x/y in -1..1. */
+static int g_stick_oct = -1;   /* last logged stick direction, -1 = centred */
+
 static void nunchuk_stick(const struct expansion_t *exp, float *x, float *y)
 {
     *x = 0.0f;
@@ -211,13 +213,31 @@ static void nunchuk_stick(const struct expansion_t *exp, float *x, float *y)
     if (exp->type != WPAD_EXP_NUNCHUK)
         return;
     float mag = exp->nunchuk.js.mag;
-    if (mag < STICK_DEADZONE)
+    if (mag < STICK_DEADZONE) {
+        g_stick_oct = -1;   /* centred */
         return;
+    }
+    /* libogc gives the stick direction as a compass bearing: 0 degrees is UP,
+     * 90 is RIGHT, growing clockwise. So x (right +) is the sine and y (up +,
+     * like an Xbox stick) is the cosine; cos/sin the other way round turned
+     * up into right and mirrored every other direction. */
     float ang = exp->nunchuk.js.ang * (float)M_PI / 180.0f;
     float scaled = (mag - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
     if (scaled > 1.0f) scaled = 1.0f;
-    *x = scaled * cosf(ang);
-    *y = scaled * sinf(ang);
+    *x = scaled * sinf(ang);
+    *y = scaled * cosf(ang);
+
+    /* Log each change of direction (8 compass points), to check the mapping. */
+    static const char *names[8] = { "up", "up-right", "right", "down-right",
+                                    "down", "down-left", "left", "up-left" };
+    float deg = exp->nunchuk.js.ang;
+    while (deg < 0) deg += 360.0f;
+    int oct = ((int)((deg + 22.5f) / 45.0f)) % 8;
+    if (oct != g_stick_oct) {
+        app_log("[input] nunchuk stick %s (angle %.0f, mag %.2f) -> x=%.2f y=%.2f\n",
+                names[oct], deg, mag, *x, *y);
+        g_stick_oct = oct;
+    }
 }
 
 /* Presses or releases a mouse button, only when its state changes. */

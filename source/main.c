@@ -432,6 +432,79 @@ static void error_screen(const char *title, const char *msg) {
     }
 }
 
+// --- Leaving the app cleanly ---
+//
+// Returning to the Homebrew Channel used to hang on a red/black garbage
+// screen. The cause: the app left while the streaming library's threads
+// (video, audio, control, input) were still running and still had network
+// requests open with IOS. While libogc shuts the system down on exit, it
+// switches to those threads, and they use hardware that is being turned off.
+// Now the stream is stopped properly first (LiStopConnection), and the
+// controllers, network and video are shut down before handing back.
+
+// 1 while the streaming library has threads running.
+static volatile int g_stream_active = 0;
+static volatile int g_stop_done = 0;
+
+static void *stop_connection_thread(void *arg) {
+    (void)arg;
+    LiStopConnection();
+    g_stop_done = 1;
+    return NULL;
+}
+
+// Runs LiStopConnection on a helper thread and waits at most timeout_ms, so a
+// hang inside it can't freeze the exit. Returns 1 if the stream stopped.
+static int stop_connection_timed(int timeout_ms) {
+    static u8 stack[64 * 1024] __attribute__((aligned(32)));
+    lwp_t t = LWP_THREAD_NULL;
+    g_stop_done = 0;
+    app_log("[exit] stopping the stream (LiStopConnection)...\n");
+    u64 t0 = gettime();
+    if (LWP_CreateThread(&t, stop_connection_thread, NULL, stack, sizeof(stack), 0x50) != 0) {
+        app_log("[exit] ERROR: can't create the stop thread; leaving the stream running\n");
+        return 0;
+    }
+    while (!g_stop_done && ticks_to_millisecs(gettime() - t0) < (u64)timeout_ms)
+        usleep(10 * 1000);
+    unsigned ms = (unsigned)ticks_to_millisecs(gettime() - t0);
+    if (!g_stop_done) {
+        app_log("[exit] WARNING: LiStopConnection still running after %u ms; giving up on it\n", ms);
+        return 0;
+    }
+    LWP_JoinThread(t, NULL);
+    g_stream_active = 0;
+    app_log("[exit] stream stopped in %u ms\n", ms);
+    return 1;
+}
+
+// Registered with atexit(): runs on every way out of main().
+static void app_shutdown(void) {
+    g_sync_every_line = 1;
+    app_log("[exit] shutting down (stream threads %s)\n",
+            g_stream_active ? "STILL RUNNING" : "stopped");
+    // (Audio DMA was already stopped by the quit path / the library's ar_stop.)
+    // Hide whatever is left in the framebuffer while the loader takes over.
+    VIDEO_SetBlack(TRUE);
+    VIDEO_Flush();
+    VIDEO_WaitVSync();
+    WPAD_Shutdown();
+    app_log("[exit] controllers off\n");
+    // Only safe once no thread has a network request in flight.
+    if (!g_stream_active) {
+        net_deinit();
+        app_log("[exit] network off\n");
+    } else {
+        app_log("[exit] network left on: stream threads may still be using it\n");
+    }
+    app_log("[exit] returning to the loader\n");
+    log_shutdown();
+    if (g_log) {
+        fclose(g_log);
+        g_log = NULL;
+    }
+}
+
 // --- Stream session: launch, stream, and wait for exit ---
 static void stream_session(SERVER_DATA *server, STREAM_CONFIGURATION *config, int appid) {
     CONNECTION_LISTENER_CALLBACKS cl;
@@ -474,8 +547,10 @@ static void stream_session(SERVER_DATA *server, STREAM_CONFIGURATION *config, in
     int sr = LiStartConnection(&server->serverInfo, config, &cl,
                                &vc, &ac, NULL, 0, NULL, 0);
     int streaming = (sr == 0);
-    if (streaming)
+    if (streaming) {
+        g_stream_active = 1;
         input_start(ui_screen_width(), ui_screen_height());
+    }
     if (!streaming)
         printf("LiStartConnection failed: %d\n", sr);
 
@@ -489,20 +564,22 @@ static void stream_session(SERVER_DATA *server, STREAM_CONFIGURATION *config, in
         WPAD_ScanPads();
         // + and - together leave the stream (see input.c for the mapping).
         if (input_poll(streaming) == INPUT_QUIT) {
-            // Crash log showed LiStopConnection() dies joining the input thread
-            // (last line: "Stopping input stream..."). So on HOME we skip the
-            // client-side teardown: ask Sunshine to quit the app (which ends the
-            // stream on the host), then return to the loader. The loader reclaims
-            // the process and its threads.
-            printf("HOME pressed: quitting app on host, skipping client teardown\n");
+            // Leaving: stop our side of the stream, then ask Sunshine to quit
+            // the app. Every line is written to the SD card right away, so if
+            // anything here still crashes, the log shows exactly where.
+            // (LiStopConnection once crashed joining the input thread; that was
+            // before the thread-stack fix, which was corrupting memory.)
+            g_sync_every_line = 1;
+            printf("Quit pressed: stopping the stream\n");
             // Stop the audio hardware first. Otherwise its sound interrupt keeps
             // calling our code after the app has returned to the loader (crash).
             audio_shutdown();
+            ui_end_frame();
+            if (streaming)
+                stop_connection_timed(8000);
             if (r == GS_OK)
                 gs_quit_app(server);
             printf("gs_quit_app returned\n");
-            log_shutdown();
-            ui_end_frame();
             return;
         }
 
@@ -548,6 +625,7 @@ int main(int argc, char **argv) {
     if (!fatInitDefault())
         printf("WARNING: SD/USB mount failed.\n");
     log_open();
+    atexit(app_shutdown);
 
     printf("Initializing network...\n");
     if (net_init() != 0) {
